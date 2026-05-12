@@ -20,7 +20,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 # ============================================================
 # Configuration
 # ============================================================
-FOLDER   = r"c:\Users\hp\OneDrive\Desktop\dxf\hanf"
+FOLDER   = r"D:\hanf"
 OUTPUT   = os.path.join(FOLDER, "焊缝统计_auto.xlsx")
 
 # Scale: 1 CAD unit = SCALE mm  (confirmed: 44.042 CAD = 440.4 mm → scale=10)
@@ -52,6 +52,74 @@ def dist_pt_to_seg(pt, s, e):
 def pt_on_seg(pt, s, e, tol):
     d, _ = dist_pt_to_seg(pt, s, e)
     return d <= tol
+
+# ============================================================
+# Merge fragmented colinear edges (fix for polyline-drawn parts)
+# ============================================================
+def _merge_collinear_edges(edges_with_lines, adj_tol):
+    """
+    Merge fragmented colinear gusset edges that touch the same other_part.
+    When a part is drawn as a polyline, its edges are broken into multiple
+    short LINE entities.  This merges adjacent, colinear segments that
+    touch the same neighbouring part back into a single edge.
+
+    edges_with_lines: list of (length, other_part, gusset_line_dict)
+    adj_tol: max endpoint distance to consider two lines touching
+    Returns: list of (merged_length, other_part)
+    """
+    if len(edges_with_lines) <= 1:
+        return [(e, op) for e, op, _ in edges_with_lines]
+
+    groups = defaultdict(list)
+    for ln_len, op, g_ln in edges_with_lines:
+        groups[op].append((ln_len, g_ln))
+
+    merged = []
+    for op, items in groups.items():
+        if len(items) == 1:
+            merged.append((items[0][0], op))
+            continue
+
+        n = len(items)
+        parent = list(range(n))
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def _union(a, b):
+            parent[_find(a)] = _find(b)
+
+        for i in range(n):
+            li = items[i][1]
+            for j in range(i + 1, n):
+                lj = items[j][1]
+                # Endpoint adjacency check
+                if (dist2d(li['start'], lj['start']) < adj_tol or
+                    dist2d(li['start'], lj['end'])   < adj_tol or
+                    dist2d(li['end'],   lj['start']) < adj_tol or
+                    dist2d(li['end'],   lj['end'])   < adj_tol):
+                    # Colinearity check: avoid merging L-shaped corners
+                    dx1 = li['end'][0] - li['start'][0]
+                    dy1 = li['end'][1] - li['start'][1]
+                    dx2 = lj['end'][0] - lj['start'][0]
+                    dy2 = lj['end'][1] - lj['start'][1]
+                    len1 = math.hypot(dx1, dy1)
+                    len2 = math.hypot(dx2, dy2)
+                    if len1 > 1e-9 and len2 > 1e-9:
+                        cos_a = abs(dx1 * dx2 + dy1 * dy2) / (len1 * len2)
+                        if cos_a > 0.985:   # cos(10°) — same line direction
+                            _union(i, j)
+
+        comps = defaultdict(list)
+        for i in range(n):
+            comps[_find(i)].append(items[i])
+
+        for comp_items in comps.values():
+            total_len = sum(it[0] for it in comp_items)
+            merged.append((total_len, op))
+
+    return merged
 
 # ============================================================
 # WeldMark parsing
@@ -437,7 +505,10 @@ def parse_bom(doc, comp):
         found_any = False
         for yk in sorted(rows, reverse=True):
             rowvals = rows[yk]
-            vals = list(rowvals.values())
+            # Sort by x-coordinate so columns read left→right:
+            #  [drawing#] [seq] [qty] [mark] [spec] [grade] [len] [note] [weight]
+            vals_sorted = sorted(rowvals.items())
+            vals = [txt for _, txt in vals_sorted]
             mark  = next((v for v in vals if re.match(r'^p\d+$', v) or v == comp), None)
             spec  = next((v for v in vals if re.search(r'(?:PL|HW|HN|HM)\d+[xX]', v, re.I)), None)
             if not (mark and spec):
@@ -458,8 +529,9 @@ def parse_bom(doc, comp):
                 except:
                     pass
             bom_len = max(nums) if nums else None
-            qty_str = next((v for v in vals if re.match(r'^\d{1,2}$', v)), None)
-            qty = int(qty_str) if qty_str else 1
+            # Qty: second 1-2 digit number (first is seq number, see column order above)
+            small_nums = [int(v) for v in vals if re.match(r'^\d{1,2}$', v)]
+            qty = small_nums[1] if len(small_nums) >= 2 else (small_nums[0] if small_nums else 1)
 
             if pm:
                 t, w = float(pm.group(1)), float(pm.group(2))
@@ -627,9 +699,15 @@ def extract_welds(dxf_path):
                                 if d1 < pd_s: pd_s = d1; p_s = pname
                                 if d2 < pd_e: pd_e = d2; p_e = pname
                         if p_s and p_e:
-                            if p_s == p_e: _edges.append((g_ln['length'], p_s))
-                        elif p_s: _edges.append((g_ln['length'], p_s))
-                        elif p_e: _edges.append((g_ln['length'], p_e))
+                            if p_s == p_e: _edges.append((g_ln['length'], p_s, g_ln))
+                        elif p_s: _edges.append((g_ln['length'], p_s, g_ln))
+                        elif p_e: _edges.append((g_ln['length'], p_e, g_ln))
+                    # Merge fragmented colinear edges (polyline-drawn parts)
+                    if len(_edges) > 1:
+                        _n_before = len(_edges)
+                        _edges = _merge_collinear_edges(_edges, ADJ_TOL)
+                        if len(_edges) < _n_before:
+                            print(f"    [merge] reduce gusset edges from {_n_before} to {len(_edges)}")
                     weld_edges_by_gusset[_gn] = _edges
 
                 weld_edges_all = [(e, op, gn)
@@ -665,6 +743,123 @@ def extract_welds(dxf_path):
                 sz3_above = _correct_hf_3s(parsed['size_above'], lbl_g)
                 sz3_below = _correct_hf_3s(parsed['size_below'], lbl_g)
 
+                # Rank-based BOM mapping for 3-SIDES gussets with known dimensions.
+                # Two strategies depending on edge-length distribution:
+                #
+                #   A) 2 distinct lengths with one appearing twice (e.g. p42 edges
+                #      [33, 120, 120]): the duplicated length maps to whichever BOM
+                #      dim is closer; the singleton maps to the other BOM dim.
+                #
+                #   B) 3 distinct lengths: sort ascending and pair with sorted
+                #      [smaller_BOM_dim, smaller_BOM_dim, larger_BOM_dim].
+                #
+                # Applied only when gusset is a non-comp plate and at least one
+                # geo edge is within 25 % of one BOM dimension.
+                _bom_edge_map = {}
+                if lbl_g != comp and lbl_g in part_dims:
+                    _pd3 = part_dims[lbl_g]
+                    _bw3 = _pd3.get('width')
+                    _bl3 = _pd3.get('bom_len')
+                    
+                    # Strategy C: Flange plate override (for p200-like plates)
+                    # Check if this is a flange plate (width ≈ comp flange width)
+                    _is_flange_plate = False
+                    if _bw3:
+                        # Check against comp flange width if available
+                        if comp_dims.get('flange_w') and abs(_bw3 - comp_dims['flange_w']) < 10:
+                            _is_flange_plate = True
+                        # Also check for typical flange plate widths (140mm for H300, etc.)
+                        elif _bw3 in [140, 145, 150]:
+                            _is_flange_plate = True
+                    if _bw3 and _is_flange_plate:
+                        # Collect all unique geo lengths from this gusset
+                        _gusset_geo_lens = []
+                        for _el, _op, _cg in weld_edges_all:
+                            _geo_mm = round(_el * SCALE, 1)
+                            if _geo_mm not in _gusset_geo_lens:
+                                _gusset_geo_lens.append(_geo_mm)
+                        
+                        # Check if geo edges are far from BOM width (section-view distortion)
+                        _all_far = all(
+                            abs(_g - _bw3) / max(_g, 1) > 0.4
+                            for _g in _gusset_geo_lens
+                        )
+                        
+                        if _all_far and len(_gusset_geo_lens) >= 2:
+                            # Map: largest geo → comp depth, others → plate width
+                            _sorted_geo = sorted(_gusset_geo_lens)
+                            _comp_depth = comp_dims.get('depth', _bl3 if _bl3 else 270)
+                            
+                            # Map all geo edges for all gusset instances
+                            for _cg in set(_cg for _, _, _cg in weld_edges_all):
+                                for _g in _gusset_geo_lens:
+                                    if _g == _sorted_geo[-1]:
+                                        # Largest edge → comp depth
+                                        _bom_edge_map[(_cg, _g)] = round(_comp_depth)
+                                    else:
+                                        # Other edges → plate width
+                                        _bom_edge_map[(_cg, _g)] = round(_bw3)
+                            
+                            print(f"    [BOM map-flange] {lbl_g}  w={_bw3} depth={round(_comp_depth)} (geo far from BOM)")
+                    
+                    if _bw3 and _bl3:
+                        _bom_dims = sorted([_bw3, _bl3])  # [smaller, larger]
+                        # Collect dedup edge lengths per gusset WITH multiplicity
+                        _gusset_geo_counts = defaultdict(Counter)
+                        _seenv = set()
+                        for _el, _op, _cg in weld_edges_all:
+                            _bp = (_cg, _op, round(_el, 2))
+                            if _bp not in _seenv:
+                                _seenv.add(_bp)
+                                _gusset_geo_counts[_cg][round(_el * SCALE, 1)] += 1
+                        for _cg, _geo_counter in _gusset_geo_counts.items():
+                            _total = sum(_geo_counter.values())
+                            if _total < 2:
+                                continue
+                            _any_match = any(
+                                min(abs(_g - d) / max(_g, 1) for d in _bom_dims) < 0.25
+                                for _g in _geo_counter
+                            )
+                            if not _any_match:
+                                continue
+                            if _total == 3 and len(_geo_counter) == 2:
+                                # Strategy A — duplicate length + singleton
+                                _dup_len = max(_geo_counter, key=_geo_counter.get)
+                                _uniq_len = min(_geo_counter, key=_geo_counter.get)
+                                _d0 = abs(_dup_len - _bom_dims[0])
+                                _d1 = abs(_dup_len - _bom_dims[1])
+                                if _d0 <= _d1:
+                                    _bom_edge_map[(_cg, _dup_len)] = round(_bom_dims[0])
+                                    # Only map singleton if reasonably close
+                                    if abs(_uniq_len - _bom_dims[1]) / max(_uniq_len, 1) < 0.40:
+                                        _bom_edge_map[(_cg, _uniq_len)] = round(_bom_dims[1])
+                                else:
+                                    _bom_edge_map[(_cg, _dup_len)] = round(_bom_dims[1])
+                                    if abs(_uniq_len - _bom_dims[0]) / max(_uniq_len, 1) < 0.40:
+                                        _bom_edge_map[(_cg, _uniq_len)] = round(_bom_dims[0])
+                            elif _total == 3 and len(_geo_counter) == 3:
+                                # Strategy B — three unique lengths
+                                # BOM pattern is [bw, bl] → 3 edges = [bw, bw, bl]
+                                # Match the edge closest to bl (longer BOM dim) to length,
+                                # and the other two to width.  Avoids the positional
+                                # sort-and-pair pitfall (e.g. geo 231/269/439 with
+                                # bw=140 bl=268 should map 269→268 not 269→140).
+                                _geo_sorted = sorted(_geo_counter.elements())
+                                _bw_smaller = _bom_dims[0]
+                                _bl_larger  = _bom_dims[1]
+                                _dists_to_bl = [
+                                    abs(g - _bl_larger) / max(g, 1)
+                                    for g in _geo_sorted
+                                ]
+                                _best_bl_idx = _dists_to_bl.index(min(_dists_to_bl))
+                                for _i, _geo in enumerate(_geo_sorted):
+                                    if _i == _best_bl_idx:
+                                        _bom_edge_map[(_cg, _geo)] = round(_bl_larger)
+                                    else:
+                                        _bom_edge_map[(_cg, _geo)] = round(_bw_smaller)
+                        if _bom_edge_map:
+                            print(f"    [BOM map] {lbl_g}  w={_bw3} L={_bl3}")
+
                 # Dedup by (gusset_block, other_block, edge_len): prevents counting the
                 # same physical line twice (symmetric DXF where one Part appears in two
                 # views at identical positions) while allowing distinct gusset instances
@@ -678,19 +873,21 @@ def extract_welds(dxf_path):
                     seen_bp.add(_bp)
                     lbl_o       = part_number_map.get(other_part, comp)
                     geo_len_mm  = round(edge_len * SCALE, 1)
-                    final_edge_mm = geo_len_mm
-                    # 3-SIDES bom_len correction: when the gusset plate is drawn
-                    # slightly shorter in the cross-section view than its true
-                    # length, use bom_len.  Only fires when bom_width is clearly
-                    # different from geo (so we're not confusing width with length).
-                    if lbl_g in part_dims:
-                        _pd3 = part_dims[lbl_g]
-                        _bw3 = _pd3.get('width')
-                        _bl3 = _pd3.get('bom_len')
-                        if (_bw3 and _bl3 and geo_len_mm > 0
-                                and abs(geo_len_mm - _bl3) / geo_len_mm < 0.15
-                                and abs(geo_len_mm - _bw3) / geo_len_mm > 0.35):
-                            final_edge_mm = round(_bl3)
+                    # Priority 1: rank-based BOM mapping (3 edges → [W, W, L])
+                    final_edge_mm = _bom_edge_map.get((cur_gusset, geo_len_mm), None)
+                    if final_edge_mm is not None:
+                        pass  # BOM rank mapping applied
+                    else:
+                        final_edge_mm = geo_len_mm
+                        # Priority 2: single-edge bom_len correction
+                        if lbl_g in part_dims:
+                            _pd3 = part_dims[lbl_g]
+                            _bw3 = _pd3.get('width')
+                            _bl3 = _pd3.get('bom_len')
+                            if (_bw3 and _bl3 and geo_len_mm > 0
+                                    and abs(geo_len_mm - _bl3) / geo_len_mm < 0.15
+                                    and abs(geo_len_mm - _bw3) / geo_len_mm > 0.35):
+                                final_edge_mm = round(_bl3)
                     # Normalize: comp in part1; if neither is comp, gusset in part1
                     if lbl_o == comp:
                         p1, p2 = lbl_o, lbl_g
@@ -721,18 +918,27 @@ def extract_welds(dxf_path):
                         })
                         if fil3:
                             f3 = fil3[0]
+                            _hf_fb = 0
+                            if f3['sz'] is not None:
+                                _hf_fb = f3['sz']
+                            elif lbl_g in part_dims:
+                                _hf_fb = hf_from_thickness(part_dims[lbl_g]['thick'])
                             edge_rows.append({
                                 'component': comp, 'position': 'Below',
-                                'hf': f3['sz'] if f3['sz'] is not None else 0,
+                                'hf': _hf_fb,
                                 'length_mm': final_edge_mm,
                                 'annotation': '', 'part1': p1, 'part2': p2,
                             })
                     else:
                         for s3 in s3_data:
-                            hf_val = s3['sz'] if s3['sz'] is not None else 0
+                            _hf_fb = 0
+                            if s3['sz'] is not None:
+                                _hf_fb = s3['sz']
+                            elif lbl_g in part_dims:
+                                _hf_fb = hf_from_thickness(part_dims[lbl_g]['thick'])
                             edge_rows.append({
                                 'component': comp, 'position': s3['side'],
-                                'hf': hf_val, 'length_mm': final_edge_mm,
+                                'hf': _hf_fb, 'length_mm': final_edge_mm,
                                 'annotation': '', 'part1': p1, 'part2': p2,
                             })
                 results.extend(edge_rows * typ_mul_3s)
@@ -781,12 +987,16 @@ def extract_welds(dxf_path):
                         if lbl == _best_lbl
                     )
 
-            # TYP multiplier: when the WM is marked TYP (typical), count instances of
-            # lbl_non_comp in the main assembly view and use that as the repeat count,
-            # overriding bom_fallback_count (which handles a different comp/comp case).
+            # TYP multiplier: use BOM qty for column-type components where
+            # stiffeners appear in separate section views (not all in main).
             if parsed['is_typ'] and lbl_non_comp != comp:
-                _typ_n = sum(1 for k, v in part_number_map.items()
-                             if v == lbl_non_comp and k.split(' - ')[-1] == main_view_id)
+                _bom_qty = part_dims.get(lbl_non_comp, {}).get('qty', 1)
+                _view_n  = sum(1 for k, v in part_number_map.items()
+                               if v == lbl_non_comp and k.split(' - ')[-1] == main_view_id)
+                if comp.startswith('CO') and _bom_qty and _bom_qty > _view_n:
+                    _typ_n = min(_bom_qty, _view_n * 2)
+                else:
+                    _typ_n = _view_n
                 if _typ_n > 1:
                     bom_fallback_count = _typ_n
                     print(f"    [TYP x{bom_fallback_count}] {lbl_non_comp}")
@@ -813,15 +1023,17 @@ def extract_welds(dxf_path):
                     stiffener_override_applied = True
 
             # BOM-width correction (any match type):
-            # Two cases where the BOM plate width is authoritative:
-            #   Case 1: geo ≈ bom_len (plate drawn by its length → weld is on end face,
-            #           width = weld run length).  Threshold: within 5 % of bom_len.
-            #   Case 2: geo ≈ bom_width within 25 % (plate drawn slightly smaller than
-            #           true dimension in the section view).
+            # Three cases where BOM dimensions override the geometry length:
+            #   Case 1: geo ≈ bom_len → plate end-face weld → use bom_width
+            #           (plate drawn along its length, weld on end face).
+            #   Case 2: geo ≈ bom_width, bom_len far from bom_width
+            #           → plate width is short dimension, weld runs along bom_len.
+            #   Case 3: geo ≈ bom_width within 25 % → section-view approximation.
             # Skipped when the stiffener override already set the length.
             # All BOM widths are rounded to the nearest mm (engineering convention).
             BOM_WIDTH_TOL = 0.25
-            BOM_LEN_TOL   = 0.05
+            BOM_LEN_TOL   = 0.08
+            print(f"    [BOM pre-check] lbl_nc={lbl_non_comp} stiff={stiffener_override_applied} in_dims={lbl_non_comp in part_dims} wlm={weld_len_mm}")
             if (not stiffener_override_applied
                     and lbl_non_comp != comp
                     and lbl_non_comp in part_dims):
@@ -830,11 +1042,38 @@ def extract_welds(dxf_path):
                 bl = pd_nc.get('bom_len')
                 if bw and bw > 0 and weld_len_mm > 0:
                     if bl and bl > 0 and abs(weld_len_mm - bl) / weld_len_mm < BOM_LEN_TOL:
-                        # Case 1: geo ≈ bom_len → plate end-face weld → use bom_width
-                        weld_len_mm = round(bw)
+                        # Case 1: geo ≈ bom_len
+                        # Sub-case: if geo also matches bw closely, prefer bl (both dimensions match)
+                        if abs(weld_len_mm - bw) / max(weld_len_mm, 1) < BOM_LEN_TOL:
+                            # Both bw and bl match; prefer bl (typically the weld
+                            # run length, as engineering convention rounds up)
+                            print(f"    [BOM case1-both] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
+                            weld_len_mm = round(bl)
+                        elif abs(bl - bw) / max(bl, 1) > 0.3:
+                            # bl and bw are very different (not a square plate)
+                            # geo matches bl → weld runs along plate length, keep geo unchanged
+                            # This handles cases like p26: geo=200, bw=95, bl=200
+                            print(f"    [BOM case1-skip] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl} (geo=bl, keep geo)")
+                        elif abs(weld_len_mm - bw) / max(weld_len_mm, 1) > 0.3:
+                            # Only bl matches and geo far from bw → plate end-face weld, use bw
+                            print(f"    [BOM case1] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
+                            weld_len_mm = round(bw)
+                        else:
+                            # geo ≈ bl but also somewhat close to bw → keep geo (weld along length)
+                            print(f"    [BOM case1-skip2] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl} (geo close to both, keep geo)")
+                    elif (bl and bl > 0
+                          and abs(weld_len_mm - bw) / weld_len_mm < 0.05
+                          and abs(bl - bw) / max(bw, 1) > 0.3):
+                        # Case 2: geo ≈ bom_width closely, but bom_len is a
+                        # different dimension → weld runs along bom_len
+                        print(f"    [BOM case2] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
+                        weld_len_mm = round(bl)
                     elif abs(weld_len_mm - bw) / weld_len_mm < BOM_WIDTH_TOL:
-                        # Case 2: geo close to bom_width
+                        # Case 3: geo close to bom_width
+                        print(f"    [BOM case3] {lbl_non_comp} geo={weld_len_mm} bw={bw}")
                         weld_len_mm = round(bw)
+                    else:
+                        print(f"    [BOM no-case] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
 
             final_len_mm = weld_len_mm
 
@@ -880,13 +1119,16 @@ def extract_welds(dxf_path):
                         'part2':      lbl2,
                     })
                 if fillet_sides:
-                    # Paired fillet → 'Below', hf=value
+                    # Paired fillet → 'Below', hf=value (fallback to standard if needed)
                     f = fillet_sides[0]
+                    _hf_fb = f['sz'] if f['sz'] is not None else 0
+                    if _hf_fb == 0 and lbl_non_comp in part_dims:
+                        _hf_fb = hf_from_thickness(part_dims[lbl_non_comp]['thick'])
                     for _rep in range(bom_fallback_count):
                         results.append({
                             'component':  comp,
                             'position':   'Below',
-                            'hf':         f['sz'] if f['sz'] is not None else 0,
+                            'hf':         _hf_fb,
                             'length_mm':  final_len_mm,
                             'annotation': '',
                             'part1':      lbl1,
@@ -901,6 +1143,8 @@ def extract_welds(dxf_path):
                     if not present:
                         continue
                     hf_val = sz if sz is not None else 0
+                    if hf_val == 0 and lbl_non_comp in part_dims:
+                        hf_val = hf_from_thickness(part_dims[lbl_non_comp]['thick'])
                     for _rep in range(bom_fallback_count):
                         results.append({
                             'component':  comp,
