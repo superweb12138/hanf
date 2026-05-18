@@ -48,7 +48,7 @@ manual = load_correct(CORRECT_FILE)
 script = load_auto(AUTO_FILE)
 
 # Only compare components for which we have DXF files
-HAVE_DXF = {'BE018','BE019','BE020','BE021','BE022','BE023','CO007','CO008','CO009'}
+HAVE_DXF = {'BE018','BE019','BE020','BE021','BE022','BE023','CO006','CO007','CO008','CO009'}
 manual = [r for r in manual if r['comp'] in HAVE_DXF]
 script = [r for r in script if r['comp'] in HAVE_DXF]
 
